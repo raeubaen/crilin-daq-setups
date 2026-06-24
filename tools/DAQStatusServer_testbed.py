@@ -1,0 +1,1041 @@
+#!/usr/bin/python -u
+
+import os
+import sys
+import re
+import time
+import glob
+import psutil
+import shlex
+import getopt
+import subprocess
+import daemon
+#import daemon.pidfile
+import datetime
+
+# Directory hosting DAQStatusServer control files
+#monitor_dir = "/home/daq/RecoMonitor/daqss"
+monitor_dir = os.getenv('DAQSTATUSSERVER',".")
+
+# Lock file containing the process id
+monitor_pid_file = "%s/run/DAQStatusServer.lock"%monitor_dir
+
+# Log and error files (used only in server mode)
+monitor_log_file = "%s/log/DAQStatusServer.log"%monitor_dir
+monitor_err_file = "%s/log/DAQStatusServer.err"%monitor_dir
+
+# Final output file in PadmeMonitor format
+monitor_out_file = "%s/tmp/TESTBED_STATUS.txt"%monitor_dir
+monitor_out_file_debug = "%s/tmp/TESTBED_STATUS_test.txt"%monitor_dir
+
+# Stop file: server will exit when found
+monitor_stop_file = "%s/run/DAQStatusServer.stop"%monitor_dir
+
+# Destination directory for final output file
+monitor_dest = "monitor@l0padme3:PadmeMonitor/watchdir/."
+monitor_dest_debug = "monitor@l0padme3:."
+#monitor_dest = "%s/watchdir/TESTBED_STATUS.txt"%monitor_dir
+#monitor_dest_debug = "%s/TESTBED_STATUS_test.txt"%monitor_dir
+
+# Pause between runs of the monitor program
+monitor_pause = 30
+
+# Shifters list
+#shifters_list = "%s/shifters.txt"%monitor_dir
+
+ssh_key = "/home/daq/.ssh/id_rsa_daq"
+
+daq_dir = "/home/daq/DAQ"
+
+disk_list = ("data01","DAQ")
+disk_mount = {
+    "data01": "/mnt/data01",
+    "DAQ": "/home"
+}
+
+reco_disk = "l1padme1"
+
+current_run_file = "%s/run/current_run"%daq_dir
+previous_run_file = "%s/run/last_run"%daq_dir
+
+runs_dir = "%s/runs"%daq_dir
+
+# Directory where OnlineMonitor trend files are stored
+trend_dir = "/home/monitor/OnlineMonitor/trend"
+
+# Short name of triggers in trigger mask
+trigmask_name = { "0":"BTF", "1":"Csm","2":"Cal","3":"DTm","4":"Un1","5":"Un2","6":"Rnd","7":"Dly" }
+
+disk_color_free = "#00CC00"
+disk_used_warn = 0.6
+disk_color_warn = "#FFC900"
+disk_used_alarm = 0.8
+disk_color_alarm = "#FF0000"
+
+trig_color_warn = "#FFC900"
+trig_color_alarm = "#FF0000"
+
+merg_color_warn = "#FFC900"
+merg_color_alarm = "#FF0000"
+
+proc_color_warn = "#FFC900"
+
+# Warning/alarm levels when too many files are written
+merg_nev_thr1_pc = 0.6
+merg_nev_col1 = "#FFFACD"
+merg_nev_fgcol1 = "#000000"
+merg_nev_thr2_pc = 0.7
+merg_nev_col2 = "#FF8C00"
+merg_nev_fgcol2 = "#FFFFFF"
+merg_nev_thr3_pc = 0.8
+merg_nev_col3 = "#FF0000"
+merg_nev_fgcol3 = "#FFFFFF"
+
+def execute_command(command):
+
+    p = subprocess.Popen(shlex.split(command),stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+    (out,err) = p.communicate()
+
+    return (p.returncode,out,err)
+
+def start_monitor(mode):
+
+    do_print = False
+
+    # Enable printout in Interactive or Debug mode
+    if mode == "I" or mode == "D":
+        do_print = True
+
+    # Redirect standard output and standard error to unbuffered files in Server mode
+    if mode == "S":
+        sys.stdout = open(monitor_log_file,'a',0)
+        sys.stderr = open(monitor_err_file,'a',0)
+
+    print "=== Starting DAQStatusServer on %s UTC ==="%now_str()
+    sys.stderr.write("=== Starting DAQStatusServer on %s UTC ===\n"%now_str())
+
+    old_current_run = ""
+    old_merger_nr = ""
+    while(True):
+
+        # If stop file is found, remove it and exit
+        check_stop_server()
+
+        current_year = time.strftime("%Y",time.gmtime())
+
+        with open(current_run_file) as f:
+            current_run = f.read().rstrip()
+        if current_run != old_current_run:
+            old_current_run = current_run
+            old_merger_nr = ""
+
+        # Handle possibility that previous_run_file does not exist (this happened!)
+        try:
+            with open(previous_run_file) as f:
+                previous_run = f.read().rstrip()
+        except:
+            previous_run = ""
+
+        run_is_over = False
+        if current_run == previous_run:
+            run_is_over = True
+            run_finish_time = os.path.getmtime(previous_run_file)
+
+        # Get run information from its configuration file
+        merger_node = "UNDEF"
+        run_type = "UNDEF"
+        run_setup = "UNDEF"
+        run_nlvl1 = "UNDEF"
+        run_lvl1_maxev = "UNDEF"
+        run_user = "UNDEF"
+        run_comment = "UNDEF"
+        run_board_list = "UNDEF"
+        run_cfg_file = "%s/%s/cfg/%s.cfg"%(runs_dir,current_run,current_run)
+        if (os.path.isfile(run_cfg_file)):
+            with open(run_cfg_file) as f:
+                for l in f:
+                    r = re.match("^\s*merger_node\s+(\S+)\s*$",l)
+                    if r: merger_node = r.group(1)
+                    r = re.match("^\s*run_type\s+(\S+)\s*$",l)
+                    if r: run_type = r.group(1)
+                    r = re.match("^\s*setup\s+(\S+)\s*$",l)
+                    if r: run_setup = r.group(1)
+                    r = re.match("^\s*level1_nproc\s+(\S+)\s*$",l)
+                    if r: run_nlvl1 = r.group(1)
+                    r = re.match("^\s*level1_maxevt\s+(\S+)\s*$",l)
+                    if r: run_lvl1_maxev = r.group(1)
+                    r = re.match("^\s*run_user\s+(.*)\s*$",l)
+                    if r: run_user = r.group(1)
+                    r = re.match("^\s*run_comment_start\s+(.*)\s*$",l)
+                    if r: run_comment = r.group(1)
+                    r = re.match("^\s*board_list\s+(.*)\s*$",l)
+                    if r: run_board_list = r.group(1)
+
+        # Get maximum number of events before we reach 1000 output files per stream
+        run_max_events = 2500000
+        try:
+            run_max_events = 1000*int(run_nlvl1)*int(run_lvl1_maxev)
+        except:
+            pass
+        merg_nev_thr1 = merg_nev_thr1_pc*run_max_events
+        merg_nev_thr2 = merg_nev_thr2_pc*run_max_events
+        merg_nev_thr3 = merg_nev_thr3_pc*run_max_events
+        if mode == "D":
+            print "Event number alarm levels: %d %d %d"%(merg_nev_thr1,merg_nev_thr2,merg_nev_thr3)
+
+        # Create list of boards from board_list
+        board_list = []
+        if run_board_list != "UNDEF":
+            for brd in run_board_list.split():
+                board_list.append(int(brd))
+
+        # Create list of enabled detectors:
+        detector_list = {}
+
+        nbrd = 0
+        for ib in (0,1,2,3,4,5,6,7,8,9,14,15,16,17,18,19,20,21,22,23):
+            if ib in board_list: nbrd += 1
+        if nbrd == 20:
+            detector_list["ECAL"] = "on"
+        elif nbrd == 0:
+            detector_list["ECAL"] = "off"
+        else:
+            detector_list["ECAL"] = "part"
+
+        if int(current_year) < 2022:
+
+            nbrd = 0
+            for ib in (10,11,12):
+                if ib in board_list: nbrd += 1
+            if nbrd == 3:
+                detector_list["PVETO"] = "on"
+            elif nbrd == 0:
+                detector_list["PVETO"] = "off"
+            else:
+                detector_list["PVETO"] = "part"
+
+            nbrd = 0
+            for ib in (24,25,26):
+                if ib in board_list: nbrd += 1
+            if nbrd == 3:
+                detector_list["EVETO"] = "on"
+            elif nbrd == 0:
+                detector_list["EVETO"] = "off"
+            else:
+                detector_list["EVETO"] = "part"
+
+            if 27 in board_list:
+                detector_list["SAC"] = "on"
+            else:
+                detector_list["SAC"] = "off"
+
+        else:
+
+            nbrd = 0
+            for ib in (10,11,24,25):
+                if ib in board_list: nbrd += 1
+            if nbrd == 4:
+                detector_list["ETAG"] = "on"
+            elif nbrd == 0:
+                detector_list["ETAG"] = "off"
+            else:
+                detector_list["ETAG"] = "part"
+
+        if 13 in board_list:
+            detector_list["HEPVETO"] = "on"
+        else:
+            detector_list["HEPVETO"] = "off"
+
+        if 28 in board_list:
+            detector_list["TARGET"] = "on"
+        else:
+            detector_list["TARGET"] = "off"
+
+        # Get zero suppression information from board config files
+        zsup_setting = {}
+        zsup_threshold = {}
+        for brd in board_list:
+            brd_cfg_file = "%s/%s/cfg/%s_b%2.2d_zsup.cfg"%(runs_dir,current_run,current_run,brd)
+            if (os.path.isfile(brd_cfg_file)):
+                with open(brd_cfg_file) as f:
+                    for l in f:
+                        r = re.match("^\s*zero_suppression\s+(\S+)\s*$",l)
+                        if r: zsup_setting[brd] = r.group(1)
+                        r = re.match("^\s*zs2_minrms\s+(\S+)\s*$",l)
+                        if r: zsup_threshold[brd] = r.group(1)
+
+        # Get trigger information from configuration file
+        trig_mask = "UNDEF"
+        trig_scale = {"0":"1","1":"1","2":"1","3":"1","4":"1","5":"1","6":"1","7":"1",}
+        trig_autopass = {"0":"0","1":"0","2":"0","3":"0","4":"0","5":"0","6":"0","7":"0",}
+        trig_cfg_file = "%s/%s/cfg/%s_trigger.cfg"%(runs_dir,current_run,current_run)
+        if (os.path.isfile(trig_cfg_file)):
+            with open(trig_cfg_file) as f:
+                for l in f:
+                    r = re.match("^\s*trigger_mask\s+(\S+)\s*$",l)
+                    if r: trig_mask = r.group(1)
+                    r = re.match("^\s*trig(\d)_scale_global\s+(\d+)\s*$",l)
+                    if r: trig_scale[r.group(1)] = r.group(2)
+                    r = re.match("^\s*trig(\d)_scale_autopass\s+(\d+)\s*$",l)
+                    if r: trig_autopass[r.group(1)] = r.group(2)
+
+        # Get disk information (size, free) from system
+        disk_info = {}
+        for disk in disk_list:
+            disk_info[disk] = os.statvfs(disk_mount[disk])
+
+        # Get information about data files produced by current run
+
+        #run_raw_dir = "/mnt/%s/DAQ/%s/rawdata/%s"%(merger_node,current_year,current_run)
+        run_raw_dir = "/mnt/data01/DAQ/%s/rawdata/%s"%(current_year,current_run)
+        run_raw_list = glob.glob("%s/*"%run_raw_dir)
+        last_raw_file = "None"
+        if run_raw_list:
+            try:
+                last_raw_file = os.path.basename(max(run_raw_list,key=os.path.getctime))
+            except:
+                pass
+
+        #run_reco_dir = "%s/DAQ/%s/reco/%s"%(disk_mount[reco_disk],current_year,current_run)
+        #run_reco_list = glob.glob("%s/*"%run_reco_dir)
+        #last_reco_file = "None"
+        #if run_reco_list:
+        #    try:
+        #        last_reco_file = os.path.basename(max(run_reco_list,key=os.path.getctime))
+        #    except:
+        #        pass
+
+        ## Get info about monitor processes
+        #recomonitor_pid = ""
+        #recomonitor_user = ""
+        #recomonitor_script = "None"
+        #recomonitor_multi = False
+        ##padmereco_pid = ""
+        ##padmereco_exe = "None"
+        ##padmereco_nevt = "None"
+        ##padmereco_multi = False
+        #runrecomonitor_pid = ""
+        #runrecomonitor_user = ""
+        #runrecomonitor_script = "None"
+        #runrecomonitor_multi = False
+        #runtrend_pid = ""
+        #runtrend_user = ""
+        #runtrend_script = "None"
+        #runtrend_multi = False
+        #onlinemonitor_pid = ""
+        #onlinemonitor_user = ""
+        #onlinemonitor_script = "None"
+        #onlinemonitor_multi = False
+        #for proc in psutil.process_iter():
+        #    try:
+        #        # Get process name & pid from process object.
+        #        if re.match("^.*\/RecoMonitor\.sh.*$"," ".join(proc.cmdline())):
+        #            if recomonitor_pid: recomonitor_multi = True
+        #            recomonitor_pid += "%d "%proc.pid
+        #            recomonitor_user += "%s "%proc.username()
+        #            recomonitor_script = proc.cmdline()[1]
+        #        #if re.match("^.*\/PadmeReco .*$"," ".join(proc.cmdline())):
+        #        #    if padmereco_pid: padmereco_multi = True
+        #        #    padmereco_pid += "%d "%proc.pid
+        #        #    padmereco_exe = proc.exe()
+        #        #    padmereco_nevt = proc.cmdline()[2]
+        #        #if re.match("^.*\/RunRecoMonitor.*$"," ".join(proc.cmdline())):
+        #        if re.match("^.*\/OnlineRecoMonitor_wd.*$"," ".join(proc.cmdline())):
+        #            if runrecomonitor_pid: runrecomonitor_multi = True
+        #            runrecomonitor_pid += "%d "%proc.pid
+        #            runrecomonitor_user += "%s "%proc.username()
+        #            runrecomonitor_script = proc.cmdline()[1]
+        #        if re.match("^.*\/OnlineMonitor_wd.*$"," ".join(proc.cmdline())):
+        #            if onlinemonitor_pid: onlinemonitor_multi = True
+        #            onlinemonitor_pid += "%d "%proc.pid
+        #            onlinemonitor_user += "%s "%proc.username()
+        #            onlinemonitor_script = proc.cmdline()[1]
+        #        if re.match("^.*\/run_t_.*$"," ".join(proc.cmdline())):
+        #            if runtrend_pid: runtrend_multi = True
+        #            runtrend_pid += "%d "%proc.pid
+        #            runtrend_user += "%s "%proc.username()
+        #            runtrend_script = proc.cmdline()[1]
+        #    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+        #        pass
+
+        # Get trigger and trigger mask information
+        trigger_nr = "Unknown"
+        #trigger_time = "Unknown"
+        trigger_rate = "Unknown"
+        trigger_total_nr = "Unknown"
+        trigger_total_rate = "Unknown"
+        #trigger_total_time = "Unknown"
+        tm_cnts = {}
+        tm_diff = {}
+        tm_rate = {}
+        tm_tot_cnts = {}
+        tm_tot_rate = {}
+        run_trigger_log = "%s/%s/log/%s_trigger.log"%(runs_dir,current_run,current_run)
+        if (os.path.isfile(run_trigger_log)):
+            (rc,out,err) = execute_command("tail -30 %s"%run_trigger_log)
+            if mode == "D":
+                print "Trigger log file",run_trigger_log
+                print "Trigger tail rc",rc
+                print "Trigger tail out",out
+                print "Trigger tail err",err
+            if rc == 0:
+                for l in iter(out.splitlines()):
+                    #r = re.match("^.*\s+Trigger\s+(\d+)\s+.*\s+(\S+)ms\s+.*ms\s*$",l)
+                    r = re.match("^.*\s+Trigger\s+(\d+)\s+.*\s+(\S+)Hz\s*$",l)
+                    if r:
+                        trigger_nr = r.group(1)
+                        #trigger_time = r.group(2)
+                        trigger_rate = r.group(2)
+                    r = re.match("^.*\s+TrigMsk\s+.*$",l)
+                    if r:
+                        rr = re.findall("\d\(\d+,\d+,\S+Hz\)",l)
+                        for m in rr:
+                            tm = re.match("(\d)\((\d+),(\d+),(\S+)Hz\)",m)
+                            tm_cnts[tm.group(1)] = tm.group(2)
+                            tm_diff[tm.group(1)] = tm.group(3)
+                            tm_rate[tm.group(1)] = tm.group(4)
+                    if run_is_over:
+                        #r = re.match("^.*Total number of events acquired:\s+(\d+)\s+.*$",l)
+                        r = re.match("^.*Total number of events acquired:\s+(\d+)\s+-\s+(\S+)\s+events/s.*$",l)
+                        if r:
+                            trigger_total_nr = r.group(1)
+                            trigger_total_rate = r.group(2)
+                        #r = re.match("^.*Total running time:\s+(\d+)\s+.*$",l)
+                        #if r:
+                        #    trigger_total_time = r.group(1)
+                        r = re.match("^.*Trigger mask statistics:\s+.*$",l)
+                        if r:
+                            rr = re.findall("\d\(\d+,\S+Hz\)",l)
+                            for m in rr:
+                                tm = re.match("(\d)\((\d+),(\S+)Hz\)",m)
+                                tm_tot_cnts[tm.group(1)] = tm.group(2)
+                                tm_tot_rate[tm.group(1)] = tm.group(3)
+
+        # Get last merger event number
+        merger_nr = "Unknown"
+        merger_total_nr = "Unknown"
+        merger_total_data = "Unknown"
+        merger_total_rate = "Unknown"
+        merger_total_data_rate = "Unknown"
+        run_merger_log = "%s/%s/log/%s_merger.log"%(runs_dir,current_run,current_run)
+        if (os.path.isfile(run_trigger_log)):
+            (rc,out,err) = execute_command("tail -60 %s"%run_merger_log)
+            if mode == "D":
+                print "Merger log file",run_merger_log
+                print "Merger tail rc",rc
+                print "Merger tail out",out
+                print "Merger tail err",err
+            if rc == 0:
+                for l in iter(out.splitlines()):
+                    r = re.match("^.*\s+Event\s+(\d+)\s+.*$",l)
+                    if r:
+                        merger_nr = r.group(1)
+                    if run_is_over:
+                        r = re.match("^.*Total\s+Events\s+(\d+)\s+Data\s+(\S+)\s+MiB\s+Rates\s+(\S+)\s+evt/s\s+(\S+)\s+MiB/s.*$",l)
+                        if r:
+                            merger_total_nr = r.group(1)
+                            merger_total_data = r.group(2)
+                            merger_total_rate = r.group(3)
+                            merger_total_data_rate = r.group(4)
+
+        run_data = "Unknown"
+        #(rc,out,err) = execute_command("du -sB1G %s"%run_raw_dir)
+        (rc,out,err) = execute_command("du -sB1 %s"%run_raw_dir)
+        if rc == 0: run_data = out.split()[0]
+        run_files = len(glob.glob("%s/*.root"%run_raw_dir))
+
+        # Get info about Level1 processes
+        lvl1_string = ""
+        if run_nlvl1 == "UNDEF":
+            lvl1_string = "Unknown"
+        else:
+            nlvl1 = int(run_nlvl1)
+            for lvl1 in range(nlvl1):
+                lvl1_nr = "Unknown"
+                lvl1_total_nr = "Unknown"
+                lvl1_total_data = "Unknown"
+                lvl1_log = "%s/%s/log/%s_lvl1_%2.2d.log"%(runs_dir,current_run,current_run,lvl1)
+                if (os.path.isfile(lvl1_log)):
+                    (rc,out,err) = execute_command("tail -10 %s"%lvl1_log)
+                    if mode == "D":
+                        print "Level1 %d log file"%lvl1,lvl1_log
+                        print "Level1 %d tail rc"%lvl1,rc
+                        print "Level1 %d tail out"%lvl1,out
+                        print "Level1 %d tail err"%lvl1,err
+                    if rc == 0:
+                        for l in iter(out.splitlines()):
+                            r = re.match("^.*\s+Event\s+(\d+)\s+.*$",l)
+                            if r: lvl1_nr = r.group(1)
+                            if run_is_over:
+                                r = re.match("^.*Events written:\s+(\d+)\s+.*$",l)
+                                if r: lvl1_total_nr = r.group(1)
+                                r = re.match("^.*Bytes written:\s+(\d+)\s+.*$",l)
+                                if r: lvl1_total_data = r.group(1)
+                    if run_is_over:
+                        lvl1_string += "("
+                        if lvl1_total_nr == "Unknown":
+                            lvl1_string += "unk"
+                            if lvl1_nr != "Unknown":
+                                lvl1_string += ",lst %s"%lvl1_nr
+                        else:
+                            lvl1_string += lvl1_total_nr
+                            if lvl1_total_data == "Unknown":
+                                lvl1_string += ",unk"
+                            else:
+                                try:
+                                    gb = float(lvl1_total_data)/1024./1024./1024.
+                                    lvl1_string += ",%.1fGiB"%gb
+                                except:
+                                    lvl1_string += ",unk"
+                        lvl1_string += ") "
+                    else:
+                        if lvl1_nr == "Unknown":
+                            lvl1_string += "idle "
+                        else:
+                            lvl1_string += "%s "%lvl1_nr
+
+        ## Get Total NPoTs for this run from OnlineMonitor LeadGlass trend file
+        #npots_total = 0
+        #npots_per_bunch = 0
+        #lg_trend_file = "%s/%s_LGTrendsBM.trend"%(trend_dir,current_run)
+        #if (os.path.isfile(lg_trend_file)):
+        #    with open(lg_trend_file, 'r') as f:
+        #        last_line = f.readlines()[-1]
+        #        values = last_line.split()
+        #        # Values: 0 time, 1 npots, 2 npots total, 3 bunch length, 4 bunch bbq
+        #        npots_total = float(values[2])
+        #if run_is_over and ("0" in tm_tot_cnts) and (tm_tot_cnts["0"] != "0"):
+        #    npots_per_bunch = npots_total/float(tm_tot_cnts["0"])
+
+        # If server is interactive, show result to stdout
+        if do_print: print "=== PADME DAQ Status - %s UTC ==="%now_str()
+
+        mon_file = monitor_out_file
+        if mode == "D": mon_file = monitor_out_file_debug
+        with open(mon_file,"w") as f:
+
+            f.write("PLOTID TESTBED_DAQ_status\n")
+            f.write("PLOTNAME Testbed DAQ Status - %s UTC\n"%now_str())
+            f.write("PLOTTYPE activetext\n")
+
+            f.write("DATA [ ")
+
+            ## Get name of current shifter
+            #current_shifter = "-"
+            #with open(shifters_list) as sl:
+            #    for l in sl:
+            #        # Skip empty and comment lines
+            #        if re.match("^\s*$",l): continue
+            #        if re.match("^\s*#.*$",l): continue
+            #        # Parse date-time/shifter
+            #        r = re.match("^\s*(\d\d\d\d-\d\d-\d\d \d\d:\d\d:\d\d)\s+(.*)$",l)
+            #        if r:
+            #            date_time_str = r.group(1)
+            #            date_time_obj = datetime.datetime.strptime(date_time_str,'%Y-%m-%d %H:%M:%S')
+            #            if date_time_obj > datetime.datetime.now(): break
+            #            current_shifter = r.group(2)
+            #f.write("{\"title\":\"Current shifter\",\"current\":{\"value\":\"%s\"}}"%current_shifter)
+            #if do_print: print "Current shifter\t%s"%current_shifter
+            #
+            #f.write(",")
+
+            current_run_string = current_run
+            if run_is_over:
+                current_run_string += " (ended on %s UTC)"%time.strftime("%Y-%m-%d %H:%M:%S",time.gmtime(run_finish_time))
+            f.write("{\"title\":\"Current run\",\"current\":{\"value\":\"%s\"}}"%current_run_string)
+            if do_print: print "Current run\t%s"%current_run_string
+
+            f.write(",")
+
+            f.write("{\"title\":\"Merger node\",\"current\":{\"value\":\"%s\"}}"%merger_node)
+            if do_print: print "Merger node\t%s"%merger_node
+
+            f.write(",")
+
+            f.write("{\"title\":\"Run setup \",\"current\":{\"value\":\"%s\"}}"%run_setup)
+            if do_print: print "Run setup\t%s"%run_setup
+
+            f.write(",")
+
+            f.write("{\"title\":\"Run type \",\"current\":{\"value\":\"%s\"}}"%run_type)
+            if do_print: print "Run type\t%s"%run_type
+
+            f.write(",")
+
+            for d in disk_list:
+                disk_size = disk_info[d].f_blocks*disk_info[d].f_bsize
+                disk_free = disk_info[d].f_bfree*disk_info[d].f_bsize
+                disk_used = disk_size-disk_free
+                disk_pcfree = 100.*disk_free/disk_size
+                tera = 1024.*1024.*1024.*1024.
+                disk_string = "%s - Size %5.1f TiB - Used %5.1f TiB - Free %5.1f TiB (%.1f%%)"%(disk_mount[d],disk_size/tera,disk_used/tera,disk_free/tera,disk_pcfree)
+                #disk_color = disk_color_free
+                disk_color = ""
+                if disk_used/disk_size > disk_used_alarm:
+                    disk_color = disk_color_alarm
+                elif disk_used/disk_size > disk_used_warn:
+                    disk_color = disk_color_warn
+                if disk_color == "":
+                    f.write("{\"title\":\"Disk %s\",\"current\":{\"value\":\"%s\"}}"%(d,disk_string))
+                else:
+                    f.write("{\"title\":\"Disk %s\",\"current\":{\"value\":\"%s\",\"col\":\"%s\"}}"%(d,disk_string,disk_color))
+                if do_print: print "Disk %s\t%s\tColor %s"%(d,disk_string,disk_color)
+                f.write(",")
+
+            f.write("{\"title\":\"Last raw file\",\"current\":{\"value\":\"%s\"}}"%last_raw_file)
+            if do_print: print "Last raw file\t%s"%last_raw_file
+
+            f.write(",")
+
+            #f.write("{\"title\":\"Last reco file\",\"current\":{\"value\":\"%s\"}}"%last_reco_file)
+            #if do_print: print "Last reco file\t%s"%last_reco_file
+            #
+            #f.write(",")
+            #
+            #padmereco_string = "None"
+            #padmereco_color = ""
+            #if padmereco_exe != "None":
+            #    padmereco_string = "%s (pid %s - n=%s)"%(padmereco_exe,padmereco_pid.rstrip(),padmereco_nevt)
+            #    if padmereco_multi: padmereco_color = proc_color_warn
+            ##else:
+            ##    padmereco_color = proc_color_warn
+            #if padmereco_color == "":
+            #    f.write("{\"title\":\"PadmeReco job \",\"current\":{\"value\":\"%s\"}}"%padmereco_string)
+            #else:
+            #    f.write("{\"title\":\"PadmeReco job \",\"current\":{\"value\":\"%s\",\"col\":\"%s\"}}"%(padmereco_string,padmereco_color))
+            #if do_print: print "PadmeReco job\t%s\t%s"%(padmereco_string,padmereco_color)
+            #
+            #f.write(",")
+                        
+            #onlinemonitor_string = "None"
+            #onlinemonitor_color = ""
+            #if onlinemonitor_script != "None":
+            #    onlinemonitor_string = "%s (user %s - pid %s)"%(onlinemonitor_script,onlinemonitor_user.rstrip(),onlinemonitor_pid.rstrip())
+            #    if onlinemonitor_multi: onlinemonitor_color = proc_color_warn
+            #else:
+            #    onlinemonitor_color = proc_color_warn
+            #if onlinemonitor_color == "":
+            #    f.write("{\"title\":\"OnlineMonitor job \",\"current\":{\"value\":\"%s\"}}"%onlinemonitor_string)
+            #else:
+            #    f.write("{\"title\":\"OnlineMonitor job \",\"current\":{\"value\":\"%s\",\"col\":\"%s\"}}"%(onlinemonitor_string,onlinemonitor_color))
+            #if do_print: print "OnlineMonitor job\t%s\t%s"%(onlinemonitor_string,onlinemonitor_color)
+            #
+            #f.write(",")
+                         
+            #recomonitor_string = "None"
+            #recomonitor_color = ""
+            #if recomonitor_script != "None":
+            #    recomonitor_string = "%s (user %s - pid %s)"%(recomonitor_script,recomonitor_user.rstrip(),recomonitor_pid.rstrip())
+            #    if recomonitor_multi: recomonitor_color = proc_color_warn
+            #else:
+            #    recomonitor_color = proc_color_warn
+            #if recomonitor_color == "":
+            #    f.write("{\"title\":\"RecoMonitor job \",\"current\":{\"value\":\"%s\"}}"%recomonitor_string)
+            #else:
+            #    f.write("{\"title\":\"RecoMonitor job \",\"current\":{\"value\":\"%s\",\"col\":\"%s\"}}"%(recomonitor_string,recomonitor_color))
+            #if do_print: print "RecoMonitor job\t%s\t%s"%(recomonitor_string,recomonitor_color)
+            #
+            #f.write(",")
+           
+            #runrecomonitor_string = "None"
+            #runrecomonitor_color = ""
+            #if runrecomonitor_script != "None":
+            #    runrecomonitor_string = "%s (user %s - pid %s)"%(runrecomonitor_script,runrecomonitor_user.rstrip(),runrecomonitor_pid.rstrip())
+            #    if runrecomonitor_multi: runrecomonitor_color = proc_color_warn
+            #else:
+            #    runrecomonitor_color = proc_color_warn
+            #if runrecomonitor_color == "":
+            #    f.write("{\"title\":\"RunRecoMonitor job \",\"current\":{\"value\":\"%s\"}}"%runrecomonitor_string)
+            #else:
+            #    f.write("{\"title\":\"RunRecoMonitor job \",\"current\":{\"value\":\"%s\",\"col\":\"%s\"}}"%(runrecomonitor_string,runrecomonitor_color))
+            #if do_print: print "RunRecoMonitor job\t%s\t%s"%(runrecomonitor_string,runrecomonitor_color)
+            #
+            #f.write(",")
+            
+            #runtrend_string = "None"
+            #runtrend_color = ""
+            #if runtrend_script != "None":
+            #    runtrend_string = "%s (user %s - pid %s)"%(runtrend_script,runtrend_user.rstrip(),runtrend_pid.rstrip())
+            #    if runtrend_multi: runtrend_color = proc_color_warn
+            #else:
+            #    runtrend_color = proc_color_warn
+            #if runtrend_color == "":
+            #    f.write("{\"title\":\"Trend job \",\"current\":{\"value\":\"%s\"}}"%runtrend_string)
+            #else:
+            #    f.write("{\"title\":\"Trend job \",\"current\":{\"value\":\"%s\",\"col\":\"%s\"}}"%(runtrend_string,runtrend_color))
+            #if do_print: print "Trend job\t%s\t%s"%(runtrend_string,runtrend_color)
+            #
+            #f.write(",")
+
+            trigger_string = ""
+            trigger_color = ""
+            if run_is_over:
+                if trigger_total_nr == "Unknown":
+                    trigger_string += "No final report"
+                    if trigger_nr != "Unknown":
+                        #rate = 100./(float(trigger_time)/1000.)
+                        #trigger_string += " - Last: %s (rate %4.1fHz)"%(trigger_nr,rate)
+                        trigger_string += " - Last: %s (rate %sHz)"%(trigger_nr,trigger_rate)
+                else:
+                    #trigger_string += "tot evts %s"%trigger_total_nr
+                    #if trigger_total_time == "Unknown":
+                    #    trigger_string += " (no avg rate)"
+                    #else:
+                    #    rate = float(trigger_total_nr)/float(trigger_total_time)
+                    #    trigger_string += " - avg rate %4.1fHz"%rate
+                    trigger_string += "tot evts %s - avg rate %sHz"%(trigger_total_nr,trigger_total_rate)
+            else:
+                if trigger_nr == "Unknown":
+                    trigger_string += "idle"
+                else:
+                    # Trigger time is the number of ms for the last 100 triggers
+                    #rate = 100./(float(trigger_time)/1000.)
+                    #trigger_string += "%s evts (rate %4.1fHz)"%(trigger_nr,rate)
+                    trigger_string += "%s evts (rate %sHz)"%(trigger_nr,trigger_rate)
+                    if run_type == "DAQ" and trigger_rate < 50.:
+                        trigger_color = trig_color_warn
+            if trigger_color == "":
+                f.write("{\"title\":\"Trigger\",\"current\":{\"value\":\"%s\"}}"%trigger_string)
+                if do_print: print "Trigger\t\t%s"%trigger_string
+            else:
+                f.write("{\"title\":\"Trigger\",\"current\":{\"value\":\"%s\",\"col\":\"%s\"}}"%(trigger_string,trigger_color))
+                if do_print: print "Trigger\t\t%s\tColor %s"%(trigger_string,trigger_color)
+
+            f.write(",")
+
+            trigmask_string = ""
+            trigmask_color = ""
+            for tid in sorted(tm_cnts):
+                if run_is_over:
+                    try:
+                        trigmask_string += "%s:%s(%sHz) "%(trigmask_name[tid],tm_tot_cnts[tid],tm_tot_rate[tid])
+                    except:
+                        # Sometimes run is over but totals are not available
+                        trigmask_string += "%s:0(0.00Hz) "%trigmask_name[tid]
+                else:
+                    trigmask_string += "%s:%s(%sHz) "%(trigmask_name[tid],tm_diff[tid],tm_rate[tid])
+                    if (run_type == "DAQ" or run_type == "COSMICS") and ( (not "1" in tm_cnts.keys()) or ( (float(tm_rate["1"]) < 1.) or (float(tm_rate["1"]) > 10.) ) ):
+                        trigmask_color = trig_color_warn
+                    if run_type == "DAQ" and ( (not "0" in tm_cnts.keys()) or (tm_diff["0"] == "0") ):
+                        trigmask_color = trig_color_alarm
+            if trigmask_color == "":
+                f.write("{\"title\":\"Trigger Mask Rates\",\"current\":{\"value\":\"%s\"}}"%trigmask_string)
+                if do_print: print "Trigger Mask Rates\t%s"%trigmask_string
+            else:
+                f.write("{\"title\":\"Trigger Mask Rates\",\"current\":{\"value\":\"%s\",\"col\":\"%s\"}}"%(trigmask_string,trigmask_color))
+                if do_print: print "Trigger Mask Rates\t%s\tColor %s"%(trigmask_string,trigmask_color)
+
+            f.write(",")
+
+            merger_string = ""
+            merger_color = ""
+            merger_fgcolor = ""
+            if run_is_over:
+                if merger_total_nr == "Unknown":
+                    merger_string += "No final report"
+                    if merger_nr != "Unknown":
+                        merger_string += " - Last merged event: %s"%merger_nr
+                    elif old_merger_nr:
+                        merger_string += " - Last merged event: %s"%old_merger_nr
+                    merger_color = merg_color_warn
+                else:
+                    merger_string += "tot evts %s - avg rate %sHz - tot data %s MiB - avg data rate %s MiB/s"%(merger_total_nr,merger_total_rate,merger_total_data,merger_total_data_rate)
+            else:
+                if merger_nr == "Unknown":
+                    if old_merger_nr:
+                        merger_string += "%s evts (problem)"%old_merger_nr
+                        merger_color = merg_color_alarm
+                    else:
+                        merger_string += "idle"
+                else:
+                    if merger_nr == old_merger_nr:
+                        merger_string += "%s evts (stuck)"%merger_nr
+                        merger_color = merg_color_alarm
+                    else:
+                        merger_string += "%s evts"%merger_nr
+                        if (int(merger_nr) > merg_nev_thr3) :
+                            merger_string += " (> %d)"%merg_nev_thr3
+                            merger_color = merg_nev_col3
+                            merger_fgcolor = merg_nev_fgcol3
+                        elif (int(merger_nr) > merg_nev_thr2) :
+                            merger_string += " (> %d)"%merg_nev_thr2
+                            merger_color = merg_nev_col2
+                            merger_fgcolor = merg_nev_fgcol2
+                        elif (int(merger_nr) > merg_nev_thr1) :
+                            merger_string += " (> %d)"%merg_nev_thr1
+                            merger_color = merg_nev_col1
+                            merger_fgcolor = merg_nev_fgcol1
+                        old_merger_nr = merger_nr
+            if merger_color == "":
+                f.write("{\"title\":\"Merger\",\"current\":{\"value\":\"%s\"}}"%merger_string)
+                if do_print: print "Merger\t\t%s"%merger_string
+            elif merger_fgcolor == "":
+                f.write("{\"title\":\"Merger\",\"current\":{\"value\":\"%s\",\"col\":\"%s\"}}"%(merger_string,merger_color))
+                if do_print: print "Merger\t\t%s\tColor %s"%(merger_string,merger_color)
+            else:
+                f.write("{\"title\":\"Merger\",\"current\":{\"value\":\"%s\",\"col\":\"%s\",\"fgcol\":\"%s\"}}"%(merger_string,merger_color,merger_fgcolor))
+                if do_print: print "Merger\t\t%s\tColor %s\tFgColor %s"%(merger_string,merger_color,merger_fgcolor)
+
+            f.write(",")
+
+            f.write("{\"title\":\"Level1\",\"current\":{\"value\":\"%s\"}}"%lvl1_string)
+            if do_print: print "Level1\t\t%s"%lvl1_string
+
+            f.write(",")
+            
+            #try:
+            #    run_file_size = float(run_data)/float(run_files)
+            #except:
+            #    run_file_size = 0.
+            #run_data_string = "%s GiB on %s files (%.3f GiB/file)"%(run_data,run_files,run_file_size)
+            try:
+                run_data_gib = float(run_data)/(1024.*1024.*1024.)
+            except:
+                run_data_gib = 0.
+            try:
+                run_file_size = run_data_gib/float(run_files)
+            except:
+                run_file_size = 0.
+            run_data_string = "%.3f GiB on %s files (%.3f GiB/file)"%(run_data_gib,run_files,run_file_size)
+            f.write("{\"title\":\"Run data\",\"current\":{\"value\":\"%s\"}}"%run_data_string)
+            if do_print: print "Run data\t%s"%run_data_string
+
+            #f.write(",")
+            #
+            #npots_data_string = "%.4e"%npots_total
+            #if run_is_over:
+            #    npots_data_string = "%.4e (%.1f NPoTs/bunch)"%(npots_total,npots_per_bunch)
+            #f.write("{\"title\":\"Run total NPoTs from LeadGlass\",\"current\":{\"value\":\"%s\"}}"%npots_data_string)
+            #if do_print: print "Run total NPoTs from LeadGlass\t%s"%npots_data_string
+
+            f.write(" ]\n")
+
+            # Window with run configuration info
+            f.write("\n")
+            f.write("PLOTID TESTBED_DAQ_config\n")
+            f.write("PLOTNAME Testbed DAQ Configuration - %s UTC\n"%now_str())
+            f.write("PLOTTYPE activetext\n")
+
+            f.write("DATA [ ")
+
+            # Run identification
+            run_string = "%s - %s"%(current_run,run_type)
+            f.write("{\"title\":\"Run name and type\",\"current\":{\"value\":\"%s\"}}"%run_string)
+            if do_print: print "Run name and type\t%s"%run_string
+            f.write(",")
+
+            # Setup in use
+            setup_string = "%s"%run_setup
+            f.write("{\"title\":\"Setup in use\",\"current\":{\"value\":\"%s\"}}"%setup_string)
+            if do_print: print "Setup in use\t%s"%setup_string
+            f.write(",")
+
+            # Shifter(s)
+            user_string = "%s"%run_user
+            f.write("{\"title\":\"User\",\"current\":{\"value\":\"%s\"}}"%user_string)
+            if do_print: print "User\t%s"%user_string
+            f.write(",")
+
+            # Start of run comment
+            run_comment = run_comment.replace('"','\'')
+            if len(run_comment) < 90:
+                soc_string = "%s"%run_comment
+            else:
+                soc_string = "%s..."%run_comment[:90]
+            f.write("{\"title\":\"Start of run comment\",\"current\":{\"value\":\"%s\"}}"%soc_string)
+            if do_print: print "Start of run comment\t%s"%soc_string
+            f.write(",")
+
+            # List of boards used in DAQ
+            board_list_string = "%s"%run_board_list
+            f.write("{\"title\":\"Enabled boards\",\"current\":{\"value\":\"%s\"}}"%board_list_string)
+            if do_print: print "Enabled boards\t%s"%board_list_string
+            f.write(",")
+
+            # List of detectors used in DAQ
+            detector_string = ""
+            if int(current_year) < 2022:
+                detectors = ("TARGET","ECAL","SAC","PVETO","EVETO","HEPVETO")
+            else:
+                detectors = ("TARGET","ECAL","ETAG","HEPVETO")
+            for det in detectors:
+                if detector_list[det] == "on":
+                    detector_string += "%s "%det
+                elif detector_list[det] == "part":
+                    detector_string += "%s(part) "%det
+            f.write("{\"title\":\"Enabled detectors\",\"current\":{\"value\":\"%s\"}}"%detector_string)
+            if do_print: print "Enabled detectors\t%s"%detector_string
+            f.write(",")
+
+            # Zero suppression info
+            zsup_string = ""
+            for brd in zsup_setting:
+                if zsup_setting[brd] == "2":
+                    zsup_string += "%d "%brd
+            if zsup_string == "":
+                zsup_string = "None"
+            f.write("{\"title\":\"Zero suppressed boards\",\"current\":{\"value\":\"%s\"}}"%zsup_string)
+            if do_print: print "Zero suppressed boards\t%s"%zsup_string
+            f.write(",")
+
+            # Trigger mask info
+            trigmsk_string = ""
+            if trig_mask != "UNDEF":
+                try:
+                    trigmsk_mask = int(trig_mask,16)
+                except:
+                    trigmsk_mask = 0
+                for i in range(8):
+                    if trigmsk_mask & (1 << i):
+                        trigmsk_string += "%s(%s,%s) "%(trigmask_name[str(i)],trig_scale[str(i)],trig_autopass[str(i)])
+            f.write("{\"title\":\"Trigger mask (scale,autopass)\",\"current\":{\"value\":\"%s\"}}"%trigmsk_string)
+            if do_print: print "Trigger mask (scale,autopass)\t%s"%trigmsk_string
+
+            f.write(" ]\n")
+
+            # Create trigger rates timeline
+            tm_string = {"0":"[","1":"[","2":"[","3":"[","4":"[","5":"[","6":"[","7":"[","T":"["}
+            total_rate = "0.00"
+            if (os.path.isfile(run_trigger_log)):
+                (rc,out,err) = execute_command("tail -2000 %s"%run_trigger_log)
+                if mode == "D":
+                    print "tail RC:",rc
+                    print "tail out:",out
+                    print "tail err:",err
+                if rc == 0:
+                    for l in iter(out.splitlines()):
+                        r = re.match("^.*\s+Trigger\s+\d+\s+.*\s+(\S+)Hz\s*$",l)
+                        if r: total_rate = r.group(1)
+                        r = re.match("^.*\s+TrigMsk\s+(\d+)\s+.*$",l)
+                        if r:
+                            tm_timestamp = r.group(1)
+                            tm_rate = {"0":"0.00","1":"0.00","2":"0.00","3":"0.00","4":"0.00","5":"0.00","6":"0.00","7":"0.00","T":total_rate}
+                            r = re.match("^.*\s+TrigMsk\s+.*$",l)
+                            if r:
+                                rr = re.findall("\d\(\d+,\d+,\S+Hz\)",l)
+                                for m in rr:
+                                    tm = re.match("(\d)\(\d+,\d+,(\S+)Hz\)",m)
+                                    tm_rate[tm.group(1)] = tm.group(2)
+                            for trg in sorted(tm_string):
+                                try:
+                                    rate = float(tm_rate[trg])
+                                except:
+                                    rate = 0.
+                                # Shift low rate triggers to improve visibility
+                                #if trg == "1": rate = 15.+rate
+                                #if trg == "3": rate = 10.+rate
+                                #if trg == "7": rate =  5.+rate
+                                if tm_string[trg] == "[":
+                                    tm_string[trg] += "[\"%s\",%.2f]"%(tm_timestamp,rate)
+                                else:
+                                    tm_string[trg] += ",[\"%s\",%.2f]"%(tm_timestamp,rate)
+            for trg in tm_string:
+                tm_string[trg] += "]"
+
+            # Window with trigger rates timeline
+            f.write("\n")
+            f.write("PLOTID TESTBED_TRIG_timeline\n")
+            f.write("PLOTNAME Testbed DAQ Trigger Rate Timeline - %s UTC\n"%now_str())
+            f.write("PLOTTYPE timeline\n")
+            f.write("TIME_FORMAT fine\n")
+            f.write("TITLE_X Time\n")
+            f.write("TITLE_Y Rate(Hz)\n")
+            #f.write("RANGE_Y 0. 60.\n")
+            f.write("RANGE_Y 0.01 10.\n")
+            #f.write("MODE   [ \"lines\"  , \"lines\"  , \"lines\"  , \"lines\"  , \"lines\"  , \"lines\"  , \"lines\"  , \"lines\" ]\n")
+            #f.write("COLOR  [ \"ff0000\" , \"00ffff\" , \"0000ff\" , \"ff00ff\" , \"000000\" , \"000000\" , \"00ff00\" , \"ffff00\" ]\n")
+            #f.write("LEGEND [ \"0 - BTF\" , \"1 - Cosmics\" , \"2 - Calib\" , \"3 - Dualtimer\" , \"4 - Rsrvd\" , \"5 - Rsrvd\" , \"6 - Random\" , \"7 - Delayed\" ]\n")
+            # Do not show unused trigger lines, use daltonic-compliant colors
+            #f.write("MODE   [ \"lines\"  , \"lines\"  , \"lines\"  , \"lines\"  , \"lines\"  , \"lines\"  , \"lines\" ]\n")
+            #f.write("COLOR  [ \"ff0000\" , \"0000ff\" , \"00ffff\" , \"ff00ff\" , \"228b22\" , \"ffc900\" , \"606060\" ]\n")
+            #f.write("LEGEND [ \"0 - BTF\" , \"1 - 15+Csmcs\" , \"2 - Calib\" , \"3 - 10+DlTmr\" , \"6 - Random\" , \"7 - 5+Dlyd\" , \"Total\"]\n")
+            #f.write("LEGEND [ \"0 - BTF\" , \"1 - Csmcs\" , \"2 - Calib\" , \"3 - DlTmr\" , \"6 - Random\" , \"7 - Dlyd\" , \"Total\"]\n")
+            f.write("MODE   [ \"lines\"  , \"lines\"  , \"lines\"  , \"lines\"  , \"lines\" ]\n")
+            f.write("COLOR  [ \"ff0000\" , \"0000ff\" , \"228b22\" , \"ffc900\" , \"606060\" ]\n")
+            f.write("LEGEND [ \"0 - BTF\" , \"1 - Csmcs\" , \"6 - Random\" , \"7 - Dlyd\" , \"Total\"]\n")
+            f.write("DATA [ ")
+            for trg in sorted(tm_string):
+                # Do not show unused trigger lines
+                if trg == "2" or trg == "3" or trg == "4" or trg == "5": continue
+                if trg != "0": f.write(" , ")
+                f.write(tm_string[trg])
+            f.write(" ]\n")
+
+        # Copy final file to monitor area
+        mon_dest = monitor_dest
+        if mode == "D": mon_dest = monitor_dest_debug
+        if do_print: print "- Moving file from %s to %s"%(mon_file,mon_dest)
+        (rc,out,err) = execute_command("scp -q -i %s %s %s"%(ssh_key,mon_file,mon_dest))
+        if mode == "D":
+            print "scp RC:",rc
+            print "scp out:",out
+            print "scp err:",err
+        #os.rename(mon_file,mon_dest)
+
+        time.sleep(monitor_pause)
+
+def now_str():
+    return time.strftime("%Y-%m-%d %H:%M:%S",time.gmtime())
+
+def check_stop_server():
+    if (os.path.exists(monitor_stop_file)):
+        if (os.path.isfile(monitor_stop_file)):
+            print "- Stop request file %s found. Removing it and exiting..."%monitor_stop_file
+            os.remove(monitor_stop_file)
+        else:
+            print "- WARNING - Stop request at path %s found but IT IS NOT A FILE."%monitor_stop_file
+            print "- I will not try to remove it but I will exit anyway..."
+        print "=== Ending DAQStatusServer on %s UTC ==="%now_str()
+        sys.exit(0)
+
+def print_help():
+    print 'DAQStatusServer [-i] [-d] [-h]'
+    print '  -i  Run the server in interactive mode'
+    print '  -d  Run the server in debug mode'
+    print '  -h  Show this help message and exit'
+
+def main(argv):
+
+    try:
+        opts,args = getopt.getopt(argv,"idh")
+    except getopt.GetoptError:
+        print_help()
+        sys.exit(2)
+
+    serverInteractive = False
+    serverDebug = False
+    for opt,arg in opts:
+        if opt == '-h':
+            print_help()
+            sys.exit()
+        elif opt == '-i':
+            serverInteractive = True
+        elif opt == '-d':
+            serverDebug = True
+
+    if serverDebug:
+
+        start_monitor("D")
+
+    elif serverInteractive:
+
+        start_monitor("I")
+
+    else:
+
+        # Creat daemon contex for run monitoring
+        context = daemon.DaemonContext(
+            working_directory = monitor_dir,
+            umask = 0o002,
+            #pidfile = daemon.pidfile.PIDLockFile(monitor_pid_file)
+        )
+
+        # Become a daemon and start the production
+        print "Starting DAQStatusServer in background"
+        context.open()
+        start_monitor("S")
+        context.close()
+
+# Execution starts here
+if __name__ == "__main__":
+   main(sys.argv[1:])

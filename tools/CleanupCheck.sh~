@@ -1,0 +1,146 @@
+#!/bin/bash
+
+ssh_user="daq"
+
+ssh_id_file="${HOME}/.ssh/id_rsa_daq"
+
+ssh_cmd="ssh -i $ssh_id_file -l $ssh_user"
+
+run_dir="${HOME}/DAQ/local/run"
+
+run_dir_files=0
+
+tot_problems=0
+
+get_run_dir_files() {
+    run_dir_files=$( $ssh_cmd $1 ls $run_dir | wc -l )
+}
+
+check_merger_node() {
+    echo
+    echo "=== Checking Merger/Level1 node $1 ==="
+    problems=0
+
+    # Check if local/run directory is empty
+    get_run_dir_files $1
+    if [[ $run_dir_files -ne 0 ]]; then
+	problems=$((problems+1))
+	echo -e "\e[31mPROBLEM\e[0m - Node $1 - $run_dir_files files found in $run_dir"
+    fi
+
+    # Check if level1 processes are still running
+    proc_list=$( $ssh_cmd $1 ps -fu daq | grep PadmeLevel1.exe | grep -v grep | grep -v bash | awk 'BEGIN{ORS=" "}{print $2}' )
+    if [ ! -z "$proc_list" ]; then
+	problems=$((problems+1))
+	echo -e "\e[31mPROBLEM\e[0m - Node $1 - Process PadmeLevel1.exe found with PID(s) $proc_list"
+    fi
+
+    # Check if merger process is still running
+    proc_list=$( $ssh_cmd $1 ps -fu daq | grep PadmeMerger.exe | grep -v grep | grep -v bash | awk 'BEGIN{ORS=" "}{print $2}' )
+    if [ ! -z "$proc_list" ]; then
+	problems=$((problems+1))
+	echo -e "\e[31mPROBLEM\e[0m - Node $1 - Process PadmeMerger.exe found with PID(s) $proc_list"
+    fi
+
+    # Check if network processes are still running
+    proc_list=$( $ssh_cmd $1 ps -fu daq | grep recv-only | grep -v grep | grep -v bash | awk 'BEGIN{ORS=" "}{print $2}' )
+    if [ ! -z "$proc_list" ]; then
+	problems=$((problems+1))
+	echo -e "\e[31mPROBLEM\e[0m - Node $1 - Network process nc found with PID(s) $proc_list"
+    fi
+
+    # Final report
+    if [[ $problems -eq 0 ]]; then
+	echo -e "Node $1 cleanup status \e[32mOK\e[0m"
+    else
+	echo -e "Node $1 cleanup status \e[31mNOT OK\e[0m - Found \e[31m$problems problem(s)\e[0m"
+    fi
+    tot_problems=$((tot_problems+problems))
+}
+
+check_daq_node() {
+    echo
+    echo "=== Checking DAQ/ZSUP node $1 ==="
+    problems=0
+
+    # Check if local/run directory is empty
+    get_run_dir_files $1
+    if [[ $run_dir_files -ne 0 ]]; then
+	problems=$((problems+1))
+	echo -e "\e[31mPROBLEM\e[0m - Node $1 - $run_dir_files files found in $run_dir"
+    fi
+
+    # Check if daq processes are still running
+    proc_list=$( $ssh_cmd $1 ps -fu daq | grep PadmeDAQ.exe | grep -v grep | grep -v bash | awk 'BEGIN{ORS=" "}{print $2}' )
+    if [ ! -z "$proc_list" ]; then
+	problems=$((problems+1))
+	echo -e "\e[31mPROBLEM\e[0m - Node $1 - Process PadmeDAQ.exe found with PID(s) $proc_list"
+    fi
+
+    # Check if network processes are still running
+    proc_list=$( $ssh_cmd $1 ps -fu daq | grep send-only | grep -v grep | grep -v bash | awk 'BEGIN{ORS=" "}{print $2}' )
+    if [ ! -z "$proc_list" ]; then
+	problems=$((problems+1))
+	echo -e "\e[31mPROBLEM\e[0m - Node $1 - Network process nc found with PID(s) $proc_list"
+    fi
+
+    # Final report
+    if [[ $problems -eq 0 ]]; then
+	echo -e "Node $1 cleanup status \e[32mOK\e[0m"
+    else
+	echo -e "Node $1 cleanup status \e[31mNOT OK\e[0m - Found \e[31m$problems problem(s)\e[0m"
+    fi
+    tot_problems=$((tot_problems+problems))
+}
+
+check_trigger_node() {
+    echo
+    echo "=== Checking Trigger node $1 ==="
+    problems=0
+
+    # Check if local/run directory is empty
+    get_run_dir_files $1
+    if [[ $run_dir_files -ne 0 ]]; then
+	problems=$((problems+1))
+	echo -e "\e[31mPROBLEM\e[0m - Node $1 - $run_dir_files files found in $run_dir"
+    fi
+
+    # Check if trigger processes are still running
+    proc_list=$( $ssh_cmd $1 ps -fu daq | grep PadmeTrig.exe | grep -v grep | grep -v bash | grep -v ssh | awk 'BEGIN{ORS=" "}{print $2}' )
+    if [ ! -z "$proc_list" ]; then
+	problems=$((problems+1))
+	echo -e "\e[31mPROBLEM\e[0m - Node $1 - Process PadmeTrig.exe found with PID(s) $proc_list"
+    fi
+
+    # Check if network processes are still running
+    proc_list=$( $ssh_cmd $1 ps -fu daq | grep send-only | grep -v grep | grep -v bash | grep -v ssh | awk 'BEGIN{ORS=" "}{print $2}' )
+    if [ ! -z "$proc_list" ]; then
+	problems=$((problems+1))
+	echo -e "\e[31mPROBLEM\e[0m - Node $1 - Network process nc found with PID(s) $proc_list"
+    fi
+
+    # Final report
+    if [[ $problems -eq 0 ]]; then
+	echo -e "Node $1 cleanup status \e[32mOK\e[0m"
+    else
+	echo -e "Node $1 cleanup status \e[31mNOT OK\e[0m - Found \e[31m$problems problem(s)\e[0m"
+    fi
+    tot_problems=$((tot_problems+problems))
+}
+
+check_merger_node l1padme3
+check_merger_node l1padme4
+
+check_daq_node l0padme4
+check_daq_node l0padme5
+
+check_trigger_node l0padme1
+
+if [[ $tot_problems -eq 0 ]]; then
+    echo
+    echo -e "\e[32mCleanupCheck OK\e[0m - All DAQ nodes are in a clean state: you can restart the run"
+else
+    echo
+    echo -e "\e[31mCleanupCheck NOT OK\e[0m - A total of \e[31m$tot_problems problem(s)\e[0m were reported: please fix them using the Cleanup Procedure and \e[4mrun this script again\e[0m"
+    echo -e "You can find the Cleanup Procedure at \e[36mhttps://github.com/PADME-Experiment/padme-fw/wiki/Clean-up-Procedure\e[0m"
+fi

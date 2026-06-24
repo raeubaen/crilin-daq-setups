@@ -1,0 +1,23 @@
+#!/bin/bash
+
+exe="/home/crilin/crilinDAQ/v1742/V1742Check.exe"
+
+hostname=$( hostname )
+
+crate="crilin"
+board_list=( 0 1 2)
+
+# Check for active DAQ processes before doing anything
+proc_list=$( ps -fu crilin | grep PadmeDAQ.exe | grep -v grep | grep -v bash | awk 'BEGIN{ORS=" "}{print $2}' )
+if [ ! -z "$proc_list" ]; then
+    echo -e "\e[31mERROR\e[0m - Node $hostname - Active DAQ processes found. Cannot run."
+    exit 1
+fi
+
+for board in ${board_list[@]}; do
+    if $exe -b $board -q; then
+	echo -e "Board $board \e[32mREADY\e[0m"
+    else
+	echo -e "Board $board \e[31mNOT READY\e[0m - Please reset the crate"
+    fi
+done

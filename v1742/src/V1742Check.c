@@ -1,0 +1,179 @@
+#include <stdlib.h>
+#include <stdio.h>
+#include <ctype.h>
+#include <string.h>
+#include <time.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <errno.h>
+#include <libgen.h>
+
+#include "CAENDigitizer.h"
+
+// Start of main program
+int main(int argc, char*argv[])
+{
+
+  //printf("Size of int %lu long int %lu long long int %lu\n",sizeof(int),sizeof(long int),sizeof(long long int));
+
+  // Make sure local data types are correct for us
+  if (sizeof(int)<4) {
+    printf("*** On this system sizeof(int) is %lu bytes while we need at least 4 bytes. Aborting ***\n",sizeof(int));
+    exit(1);
+  }
+  if (sizeof(long)<8) {
+    printf("*** On this system sizeof(long) is %lu bytes while we need at least 8 bytes. Aborting ***\n",sizeof(long));
+    exit(1);
+  }
+
+  // Use line buffering for stdout
+  setlinebuf(stdout);
+
+  // Parse options
+  int board = 0;
+  int c;
+  int quiet = 0;
+  int reset = 0;
+  while ((c = getopt (argc, argv, "b:qrh")) != -1)
+    switch (c)
+      {
+      case 'b':
+	board = atoi(optarg);
+        break;
+      case 'q':
+	quiet = 1;
+	break;
+      case 'r':
+	reset = 1;
+	break;
+      case 'h':
+	fprintf(stdout,"\nPadmeDAQ [-b board_id] [-h]\n\n");
+	fprintf(stdout,"  -b: id of board to check (default: %d)\n",board);
+	fprintf(stdout,"  -h: show this help message and exit\n\n");
+	exit(0);
+      case '?':
+        if (optopt == 'b')
+          fprintf (stderr, "Option -%c requires an argument.\n", optopt);
+        else if (isprint (optopt))
+          fprintf (stderr, "Unknown option '-%c'.\n", optopt);
+        else
+          fprintf (stderr,"Unknown option character '\\x%x'.\n",optopt);
+        exit(1);
+      default:
+        abort ();
+      }
+
+  /* We assume that the node check is already done
+  // Verify board/daq node match
+  char hostname[40];
+  if (! getenv("HOSTNAME")) {
+    fprintf(stderr,"ERROR - Environment variable HOSTNAME not found.\n");
+    exit(1);
+  }
+  if(snprintf(hostname, 40, "%s", getenv("HOSTNAME")) >= 40){
+    fprintf(stderr, "ERROR - HOSTNAME environment variable is longer than 40 characters. Aborting\n");
+    exit(1);
+  }
+
+  // Boards 0 to 13 are on l0padme4, boards 14 to 28 are on l0padme5
+  if ( board<14 && strcmp(hostname,"l0padme4") && strcmp(hostname,"l0padme4.lnf.infn.it") ) {
+    fprintf(stderr, "ERROR - Board number %d is connected to l0padme4 but we are on %s. Aborting\n",board,hostname);
+    exit(1);
+  }
+  if ( board>=14 && strcmp(hostname,"l0padme5") && strcmp(hostname,"l0padme5.lnf.infn.it") ) {
+    fprintf(stderr, "ERROR - Board number %d is connected to l0padme5 but we are on %s. Aborting\n",board,hostname);
+    exit(1);
+  }
+  */
+
+  // Assign channel/slot to board
+  int channel = 0;
+  int slot = 0;
+  switch (board)
+    {
+    case  0: channel = 49826; slot = 0; break;
+    case  1: channel = 0; slot = 1; break;
+    case  2: channel = 0; slot = 2; break;
+    case  3: channel = 0; slot = 3; break;
+    case  4: channel = 0; slot = 4; break;
+    case  5: channel = 1; slot = 0; break;
+    case  6: channel = 1; slot = 1; break;
+    case  7: channel = 1; slot = 2; break;
+    case  8: channel = 1; slot = 3; break;
+    case  9: channel = 1; slot = 4; break;
+    case 10: channel = 2; slot = 0; break;
+    case 11: channel = 2; slot = 1; break;
+    case 12: channel = 2; slot = 2; break;
+    case 13: channel = 2; slot = 3; break;
+    case 14: channel = 0; slot = 0; break;
+    case 15: channel = 0; slot = 1; break;
+    case 16: channel = 0; slot = 2; break;
+    case 17: channel = 0; slot = 3; break;
+    case 18: channel = 0; slot = 4; break;
+    case 19: channel = 1; slot = 0; break;
+    case 20: channel = 1; slot = 1; break;
+    case 21: channel = 1; slot = 2; break;
+    case 22: channel = 1; slot = 3; break;
+    case 23: channel = 1; slot = 4; break;
+    case 24: channel = 2; slot = 0; break;
+    case 25: channel = 2; slot = 1; break;
+    case 26: channel = 2; slot = 2; break;
+    case 27: channel = 2; slot = 3; break;
+    case 28: channel = 3; slot = 0; break;
+    }
+
+  // Show welcome message
+  //if (! quiet) printf("- Connecting to CAEN digitizer board %d on link %d slot %d of node %s\n",board,channel,slot,hostname);
+  if (! quiet) printf("- Connecting to CAEN digitizer board %d on link %d slot %d\n",board,channel,slot);
+
+  // Open connection to digitizer and initialize Handle global variable
+  int Handle;
+  CAEN_DGTZ_ErrorCode ret;
+  ret = CAEN_DGTZ_OpenDigitizer(CAEN_DGTZ_OpticalLink,channel,slot,0,&Handle);
+  if (ret != CAEN_DGTZ_Success) {
+    if (! quiet) fprintf(stderr,"ERROR - Unable to connect to digitizer. Error code: %d\n",ret);
+    exit(1);
+  }
+
+  // Show information on connected digitizer
+  if (! quiet) {
+    CAEN_DGTZ_BoardInfo_t boardInfo;
+    ret = CAEN_DGTZ_GetInfo(Handle, &boardInfo);
+    if (ret != CAEN_DGTZ_Success) {
+      fprintf(stderr,"ERROR - Unable to retrieve information about the digitizer. Error code: %d\n",ret);
+      exit(1);
+    }
+    printf("- Connected to CAEN Digitizer Model %s (model %d family %d)\n",
+	   boardInfo.ModelName,boardInfo.Model,boardInfo.FamilyCode);
+    printf("- %u channels, %u bits ADC samples\n",boardInfo.Channels,boardInfo.ADC_NBits);
+    printf("- Serial number: %u\n", boardInfo.SerialNumber);
+    printf("- ROC FPGA Release: %s\n", boardInfo.ROC_FirmwareRel);
+    printf("- AMC FPGA Release: %s\n", boardInfo.AMC_FirmwareRel);
+    printf("- PCB revision number: %u\n", boardInfo.PCB_Revision);
+  }
+
+  // Reset board
+  if (reset) {
+    if (! quiet) printf ("- Resetting digitizer... ");
+    ret = CAEN_DGTZ_Reset(Handle);
+    if (ret != CAEN_DGTZ_Success) {
+      if (! quiet) fprintf(stderr,"\nERROR - Unable to reset digitizer. Error code: %d\n",ret);
+      exit(1);
+    }
+    if (! quiet) printf ("done!\n");
+  }
+
+  // Close connection
+  if (! quiet) printf ("- Closing connection to digitizer... ");
+  ret = CAEN_DGTZ_CloseDigitizer(Handle);
+  if (ret != CAEN_DGTZ_Success) {
+    if (! quiet) fprintf(stderr,"\nERROR - Unable to close digitizer connection. Error code: %d\n",ret);
+    exit(1);
+  }
+  if (! quiet) printf ("done!\n");
+
+  exit(0);
+}

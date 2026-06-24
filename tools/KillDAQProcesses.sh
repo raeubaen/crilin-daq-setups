@@ -1,0 +1,121 @@
+#!/bin/bash
+
+run_dir="${HOME}/crilinDAQ/local/run"
+
+run_dir_files=0
+
+tot_problems=0
+
+get_run_dir_files() {
+    run_dir_files=$( ls $run_dir | wc -l )
+}
+
+check_merger_node() {
+    echo
+    echo "=== Checking Merger/Level1 ==="
+    problems=0
+
+    ## Check if local/run directory is empty
+    #get_run_dir_files
+    #if [[ $run_dir_files -ne 0 ]]; then
+    #	problems=$((problems+1))
+    #	echo -e "\e[31mPROBLEM\e[0m - $run_dir_files files found in $run_dir"
+    #fi
+
+    # Check if level1 processes are still running
+    proc_list=$( ps -fu $USER | grep PadmeLevel1.exe | grep -v grep | grep -v bash | awk 'BEGIN{ORS=" "}{print $2}' )
+    if [ ! -z "$proc_list" ]; then
+	problems=$((problems+1))
+	echo -e "\e[31mPROBLEM\e[0m - Process PadmeLevel1.exe found with PID(s) $proc_list"
+	kill -9 $proc_list
+    fi
+
+    # Check if merger process is still running
+    proc_list=$( ps -fu $USER | grep PadmeMerger.exe | grep -v grep | grep -v bash | awk 'BEGIN{ORS=" "}{print $2}' )
+    if [ ! -z "$proc_list" ]; then
+	problems=$((problems+1))
+	echo -e "\e[31mPROBLEM\e[0m - Process PadmeMerger.exe found with PID(s) $proc_list"
+	kill -9 $proc_list
+    fi
+
+    # Final report
+    if [[ $problems -eq 0 ]]; then
+	echo -e "Merger/Level1 cleanup status \e[32mOK\e[0m"
+    else
+	echo -e "Merger/Level1 cleanup status \e[31mNOT OK\e[0m - Found \e[31m$problems problem(s)\e[0m"
+    fi
+    tot_problems=$((tot_problems+problems))
+}
+
+check_daq_node() {
+    echo
+    echo "=== Checking DAQ/ZSUP ==="
+    problems=0
+
+    # Check if local/run directory is empty
+    get_run_dir_files
+    if [[ $run_dir_files -ne 0 ]]; then
+	problems=$((problems+1))
+	echo -e "\e[31mPROBLEM\e[0m - $run_dir_files files found in $run_dir"
+	#rm $(run_dir)/*
+    fi
+
+    # Check if daq processes are still running
+    proc_list=$( ps -fu $USER | grep PadmeDAQ.exe | grep -v grep | grep -v bash | awk 'BEGIN{ORS=" "}{print $2}' )
+    if [ ! -z "$proc_list" ]; then
+	problems=$((problems+1))
+	echo -e "\e[31mPROBLEM\e[0m - Process PadmeDAQ.exe found with PID(s) $proc_list"
+	kill -9 $proc_list
+    fi
+
+    # Final report
+    if [[ $problems -eq 0 ]]; then
+	echo -e "DAQ/ZSUP cleanup status \e[32mOK\e[0m"
+    else
+	echo -e "DAQ/ZSUP cleanup status \e[31mNOT OK\e[0m - Found \e[31m$problems problem(s)\e[0m"
+    fi
+    tot_problems=$((tot_problems+problems))
+}
+
+check_trigger_node() {
+    echo
+    echo "=== Checking Trigger ==="
+    problems=0
+
+    ## Check if local/run directory is empty
+    #get_run_dir_files
+    #if [[ $run_dir_files -ne 0 ]]; then
+    #	problems=$((problems+1))
+    #	echo -e "\e[31mPROBLEM\e[0m - $run_dir_files files found in $run_dir"
+    #fi
+
+    # Check if trigger processes are still running
+    proc_list=$( ps -fu $USER | grep PadmeTrig.exe | grep -v grep | grep -v bash | grep -v ssh | awk 'BEGIN{ORS=" "}{print $2}' )
+    if [ ! -z "$proc_list" ]; then
+	problems=$((problems+1))
+	echo -e "\e[31mPROBLEM\e[0m - Process PadmeTrig.exe found with PID(s) $proc_list"
+	kill -9 $proc_list
+    fi
+
+    # Final report
+    if [[ $problems -eq 0 ]]; then
+	echo -e "Trigger cleanup status \e[32mOK\e[0m"
+    else
+	echo -e "Trigger cleanup status \e[31mNOT OK\e[0m - Found \e[31m$problems problem(s)\e[0m"
+    fi
+    tot_problems=$((tot_problems+problems))
+}
+
+check_merger_node
+
+check_daq_node
+
+check_trigger_node
+
+if [[ $tot_problems -eq 0 ]]; then
+    echo
+    echo -e "\e[32mCleanupCheck OK\e[0m - DAQ is in a clean state: you can restart the run"
+else
+    echo
+    echo -e "\e[31mCleanupCheck NOT OK\e[0m - A total of \e[31m$tot_problems problem(s)\e[0m were reported: please fix them on the local node and \e[4mrun this script again\e[0m"
+fi

@@ -1,0 +1,4 @@
+#!/bin/bash
+
+ssh -i /home/daq/.ssh/id_rsa_daq -l daq l0padme4 "cd DAQ/v1742 && ./V1742Check.sh"
+ssh -i /home/daq/.ssh/id_rsa_daq -l daq l0padme5 "cd DAQ/v1742 && ./V1742Check.sh"
